@@ -45,8 +45,8 @@ logger = logging.getLogger('api_logger')
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
+    default_limits=["500 per hour"],  # Límite global conservador
+    storage_uri="memory://"  # Usamos memoria por simplicidad, considera Redis para alta carga
 )
 
 # =========================
@@ -62,7 +62,7 @@ def init_db():
         client = MongoClient(
             MONGO_URI,
             tls=True,
-            tlsAllowInvalidCertificates=False  # Cambiar a True si sigue fallando por certificados
+            tlsAllowInvalidCertificates=False
         )
         db = client['gateway_db']
         logs_collection = db['logs']
@@ -80,12 +80,13 @@ init_db()
 @app.errorhandler(RateLimitExceeded)
 def rate_limit_exceeded(e):
     route_limits = {
-        '/auth/': '30 peticiones por minuto',
-        '/user/': '30 peticiones por minuto',
-        '/task/': '30 peticiones por minuto',
+        '/auth/': '100 peticiones por minuto',
+        '/user/': '100 peticiones por minuto',
+        '/task/': '100 peticiones por minuto',
+        '/logs': '50 peticiones por minuto'
     }
-    default_limits = '200 peticiones por día, 50 peticiones por hora'
-    route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/')) else None
+    default_limits = '500 peticiones por hora'
+    route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/', '/logs')) else None
     limit_message = route_limits.get(route, default_limits)
 
     response = jsonify({
@@ -101,7 +102,7 @@ def rate_limit_exceeded(e):
 # =========================
 def log_request(response):
     if logs_collection is None:
-        return response  # Si DB no está lista, no loguea
+        return response
 
     start_time = getattr(request, 'start_time', time.time())
     duration = time.time() - start_time
@@ -151,6 +152,7 @@ def log_request(response):
     else:
         logger.error(log_message)
 
+# Middleware para logear solicitudes y respuestas
 @app.before_request
 def before_request():
     request.start_time = time.time()
@@ -164,16 +166,17 @@ def after_request(response):
 # Rutas
 # =========================
 @app.route('/logs', methods=['GET'])
+@limiter.limit("50 per minute")  # Límite específico para /logs
 def get_logs():
     if logs_collection is None:
         return jsonify({"error": "Base de datos no disponible"}), 500
-    logs = list(logs_collection.find().sort('timestamp', -1).limit(100))
+    logs = list(logs_collection.find().sort('timestamp', -1))
     for log in logs:
         log['_id'] = str(log['_id'])
     return jsonify({"logs": logs}), 200
 
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("30 per minute")
+@limiter.limit("100 per minute")
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
@@ -186,7 +189,7 @@ def proxy_auth(path):
     return jsonify(resp.json()), resp.status_code
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("30 per minute")
+@limiter.limit("100 per minute")
 def proxy_user(path):
     method = request.method
     url = f'{USER_SERVICE_URL}/{path}'
@@ -199,7 +202,7 @@ def proxy_user(path):
     return jsonify(resp.json()), resp.status_code
 
 @app.route('/task/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("30 per minute")
+@limiter.limit("100 per minute")
 def proxy_task(path):
     method = request.method
     url = f'{TASK_SERVICE_URL}/{path}'
