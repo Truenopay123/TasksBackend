@@ -8,7 +8,9 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_limiter import Limiter, RateLimitExceeded
 from flask_limiter.util import get_remote_address
-from pymongo import MongoClient
+from pymongo import MongoClient, DESCENDING
+from bson import ObjectId
+import pytz
 import ssl
 
 # =========================
@@ -166,14 +168,87 @@ def after_request(response):
 # Rutas
 # =========================
 @app.route('/logs', methods=['GET'])
-@limiter.limit("50 per minute")  # Límite específico para /logs
+@limiter.limit("50 per minute")  # Límite de tasa para /logs
 def get_logs():
+    """Recupera los logs de MongoDB con filtros opcionales."""
     if logs_collection is None:
-        return jsonify({"error": "Base de datos no disponible"}), 500
-    logs = list(logs_collection.find().sort('timestamp', -1))
-    for log in logs:
-        log['_id'] = str(log['_id'])
-    return jsonify({"logs": logs}), 200
+        logger.error("Base de datos no disponible")
+        return jsonify({
+            "statusCode": 500,
+            "intData": {
+                "message": "Base de datos no disponible",
+                "data": []
+            }
+        }), 500
+
+    try:
+        # Filtros opcionales desde los parámetros de la solicitud
+        user = request.args.get('user')
+        route = request.args.get('route')
+        status = request.args.get('status')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+
+        query = {}
+        if user:
+            query['user'] = user
+        if route:
+            query['route'] = route
+        if status:
+            try:
+                query['status'] = int(status)  # Convertir status a entero
+            except ValueError:
+                logger.warning(f"Parámetro status inválido: {status}")
+                return jsonify({
+                    "statusCode": 400,
+                    "intData": {
+                        "message": "El parámetro 'status' debe ser un número entero",
+                        "data": []
+                    }
+                }), 400
+        if start_date and end_date:
+            try:
+                # Convertir fechas a formato ISO y manejar zona horaria
+                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                query['timestamp'] = {
+                    "$gte": start_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    "$lte": end_dt.strftime('%Y-%m-%d %H:%M:%S')
+                }
+            except ValueError:
+                logger.warning(f"Formato de fecha inválido: start_date={start_date}, end_date={end_date}")
+                return jsonify({
+                    "statusCode": 400,
+                    "intData": {
+                        "message": "Formato de fecha inválido. Use formato ISO (YYYY-MM-DD)",
+                        "data": []
+                    }
+                }), 400
+
+        # Obtener logs con filtros y ordenar por timestamp descendente
+        logs = list(logs_collection.find(query).sort('timestamp', DESCENDING))
+        for log in logs:
+            log['_id'] = str(log['_id'])  # Convertir ObjectId a string para JSON
+
+        logger.info(f"Logs recuperados exitosamente. Cantidad: {len(logs)}")
+        return jsonify({
+            "statusCode": 200,
+            "intData": {
+                "message": "Logs recuperados exitosamente",
+                "data": logs
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error al recuperar logs: {str(e)}")
+        return jsonify({
+            "statusCode": 500,
+            "intData": {
+                "message": "Error al recuperar los logs",
+                "error": str(e),
+                "data": []
+            }
+        }), 500
 
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @limiter.limit("100 per minute")
