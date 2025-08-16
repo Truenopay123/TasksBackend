@@ -168,19 +168,8 @@ def after_request(response):
 # Rutas
 # =========================
 @app.route('/logs', methods=['GET'])
-@limiter.limit("50 per minute")  # Límite de tasa para /logs
 def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
-    if logs_collection is None:
-        logger.error("Base de datos no disponible")
-        return jsonify({
-            "statusCode": 500,
-            "intData": {
-                "message": "Base de datos no disponible",
-                "data": []
-            }
-        }), 500
-
     try:
         # Filtros opcionales desde los parámetros de la solicitud
         user = request.args.get('user')
@@ -195,61 +184,30 @@ def get_logs():
         if route:
             query['route'] = route
         if status:
-            try:
-                query['status'] = int(status)  # Convertir status a entero
-            except ValueError:
-                logger.warning(f"Parámetro status inválido: {status}")
-                return jsonify({
-                    "statusCode": 400,
-                    "intData": {
-                        "message": "El parámetro 'status' debe ser un número entero",
-                        "data": []
-                    }
-                }), 400
+            query['status'] = {"$numberInt": int(status)}  # Ajusta según el formato de status
         if start_date and end_date:
-            try:
-                # Acepta fechas en formato YYYY-MM-DD y filtra por rango de días completos
-                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-                # Filtra desde el inicio del día de start_dt hasta el final del día de end_dt
-                query['timestamp'] = {
-                    "$gte": start_dt.strftime('%Y-%m-%d 00:00:00'),
-                    "$lte": end_dt.strftime('%Y-%m-%d 23:59:59')
-                }
-            except ValueError:
-                logger.warning(f"Formato de fecha inválido: start_date={start_date}, end_date={end_date}")
-                return jsonify({
-                    "statusCode": 400,
-                    "intData": {
-                        "message": "Formato de fecha inválido. Use formato YYYY-MM-DD",
-                        "data": []
-                    }
-                }), 400
-
-        # Obtener logs con filtros y ordenar por timestamp descendente
-        logs = list(logs_collection.find(query).sort('timestamp', DESCENDING))
+            query['timestamp'] = {"$gte": start_date, "$lte": end_date}
+        
+        logs = list(logs_collection.find().sort("timestamp", -1))
         for log in logs:
-            log['_id'] = str(log['_id'])  # Convertir ObjectId a string para JSON
+            log['_id'] = str(log['_id'])  # Convierte ObjectId a string para JSON
 
-        logger.info(f"Logs recuperados exitosamente. Cantidad: {len(logs)}")
         return jsonify({
             "statusCode": 200,
             "intData": {
                 "message": "Logs recuperados exitosamente",
                 "data": logs
             }
-        }), 200
-
+        })
     except Exception as e:
-        logger.error(f"Error al recuperar logs: {str(e)}")
         return jsonify({
             "statusCode": 500,
             "intData": {
                 "message": "Error al recuperar los logs",
-                "error": str(e),
-                "data": []
+                "error": str(e)
             }
-        }), 500
+        })
+
 
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @limiter.limit("100 per minute")
