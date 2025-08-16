@@ -208,19 +208,20 @@ def get_logs():
                 }), 400
         if start_date and end_date:
             try:
-                # Convertir fechas a formato ISO y manejar zona horaria
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                # Acepta fechas en formato YYYY-MM-DD y filtra por rango de días completos
+                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                # Filtra desde el inicio del día de start_dt hasta el final del día de end_dt
                 query['timestamp'] = {
-                    "$gte": start_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    "$lte": end_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    "$gte": start_dt.strftime('%Y-%m-%d 00:00:00'),
+                    "$lte": end_dt.strftime('%Y-%m-%d 23:59:59')
                 }
             except ValueError:
                 logger.warning(f"Formato de fecha inválido: start_date={start_date}, end_date={end_date}")
                 return jsonify({
                     "statusCode": 400,
                     "intData": {
-                        "message": "Formato de fecha inválido. Use formato ISO (YYYY-MM-DD)",
+                        "message": "Formato de fecha inválido. Use formato YYYY-MM-DD",
                         "data": []
                     }
                 }), 400
