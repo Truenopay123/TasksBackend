@@ -82,10 +82,10 @@ init_db()
 @app.errorhandler(RateLimitExceeded)
 def rate_limit_exceeded(e):
     route_limits = {
-        '/auth/': '100 peticiones por minuto',
-        '/user/': '100 peticiones por minuto',
-        '/task/': '100 peticiones por minuto',
-        '/logs': '50 peticiones por minuto'
+        '/auth/': '100 peticiones por segundo',
+        '/user/': '100 peticiones por segundo',
+        '/task/': '100 peticiones por segundo',
+        '/logs': '100 peticiones por segundo'
     }
     default_limits = '500 peticiones por hora'
     route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/', '/logs')) else None
@@ -168,6 +168,7 @@ def after_request(response):
 # Rutas
 # =========================
 @app.route('/logs', methods=['GET'])
+@limiter.limit("100 per second")
 def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
     try:
@@ -184,7 +185,7 @@ def get_logs():
         if route:
             query['route'] = route
         if status:
-            query['status'] = {"$numberInt": int(status)}  # Ajusta según el formato de status
+            query['status'] = int(status)  # Ajusta según el formato de status
         if start_date and end_date:
             query['timestamp'] = {"$gte": start_date, "$lte": end_date}
         
@@ -208,9 +209,8 @@ def get_logs():
             }
         })
 
-
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("100 per minute")
+@limiter.limit("100 per second")
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
@@ -223,7 +223,7 @@ def proxy_auth(path):
     return jsonify(resp.json()), resp.status_code
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("100 per minute")
+@limiter.limit("100 per second")
 def proxy_user(path):
     method = request.method
     url = f'{USER_SERVICE_URL}/{path}'
@@ -236,7 +236,7 @@ def proxy_user(path):
     return jsonify(resp.json()), resp.status_code
 
 @app.route('/task/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("100 per minute")
+@limiter.limit("100 per second")
 def proxy_task(path):
     method = request.method
     url = f'{TASK_SERVICE_URL}/{path}'
