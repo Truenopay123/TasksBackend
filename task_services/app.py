@@ -1,148 +1,44 @@
-import os
-import time
-import logging
-import jwt
 from flask import Flask, jsonify, request
+import datetime
 from flask_cors import CORS
-from flask_limiter import Limiter, RateLimitExceeded
+import jwt
+from functools import wraps
+from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient
 from bson import ObjectId
 from werkzeug.security import generate_password_hash
-from functools import wraps
-from datetime import datetime
+import os  # Agregado para variables de entorno
 
-# Configuración Flask
 app = Flask(__name__)
 CORS(app)
 
-# Variables de entorno
+# Configuración de MongoDB Atlas y claves desde variables de entorno
 SECRET_KEY = os.environ.get('SECRET_KEY', "QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8Jo6//g")
 MONGO_URI = os.environ.get('MONGO_URI', "mongodb+srv://2023171002:1234@cluster0.rquhrnu.mongodb.net/tasks_db?retryWrites=true&w=majority&appName=Cluster0")
-REDIS_URL = os.environ.get('REDIS_URL', "redis://red-d2gm9ibuibrs73eft4l0:6379")
-
-# Configuración del logger
-logging.basicConfig(
-    filename='task_service.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('task_service_logger')
-
-# Conexión a MongoDB
 client = MongoClient(MONGO_URI)
 db = client['tasks_db']
 tasks_collection = db['tasks']
 users_collection = db['users']
-task_logs_collection = db['task_logs']
 
 # Crear índices para evitar duplicados
 tasks_collection.create_index("name", unique=True)
 users_collection.create_index("username", unique=True)
 
-# Configuración Rate Limiter con Redis
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["1000 per second", "200 per day", "50 per hour"],  # Límite global: 1000 req/s
-    storage_uri=REDIS_URL
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
 )
 
-# Manejador de errores Rate Limit
-@app.errorhandler(RateLimitExceeded)
-def rate_limit_exceeded(e):
-    route_limits = {
-        '/tasks': '30 peticiones por minuto',
-        '/id_tasks/': '30 peticiones por minuto',
-        '/Usertasks/': '30 peticiones por minuto',
-        '/register_task': '30 peticiones por minuto',
-        '/update_task/': '30 peticiones por minuto',
-        '/delete_task/': '30 peticiones por minuto',
-        '/disable_task/': '30 peticiones por minuto',
-        '/enable_task/': '30 peticiones por minuto',
-        '/update_task_status/': '30 peticiones por minuto',
-        '/logs': '30 peticiones por minuto',
-        '/': '1000 peticiones por segundo'
-    }
-    default_limits = '1000 peticiones por segundo, 200 peticiones por día o 50 peticiones por hora'
-    route = request.path if request.path in route_limits else request.path.split('/')[1] + '/' if request.path.startswith(tuple(route_limits.keys())) else '/'
-    limit_message = route_limits.get(route, default_limits)
-
-    log_message = (
-        f"Rate limit excedido: {limit_message} "
-        f"Route: {request.path} "
-        f"IP: {get_remote_address()} "
-        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    logger.warning(log_message)
-
-    response = jsonify({
-        'statusCode': 429,
-        'intData': {
-            'message': f'Has alcanzado el límite de peticiones: {limit_message}. Por favor, intenta de nuevo más tarde.',
-            'data': None
-        }
-    })
-    response.status_code = 429
-    return response
-
-# Logging de requests
-def log_request(response):
-    start_time = getattr(request, 'start_time', time.time())
-    duration = time.time() - start_time
-
-    user = 'anonymous'
-    token = request.headers.get('Authorization')
-    if token and token.startswith('Bearer '):
-        try:
-            decoded_token = jwt.decode(token.split(' ')[1], SECRET_KEY, algorithms=['HS256'])
-            user = decoded_token.get('username', 'anonymous')
-        except jwt.InvalidTokenError:
-            user = 'invalid_token'
-
-    log_message = {
-        'route': request.path,
-        'service': 'task_service',
-        'method': request.method,
-        'status': response.status_code,
-        'response_time': duration,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'user': user
-    }
-    task_logs_collection.insert_one(log_message)
-
-    log_file_message = (
-        f"Route: {request.path} "
-        f"Method: {request.method} "
-        f"Status: {response.status_code} "
-        f"response_time: {duration:.2f}s "
-        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-        f"User: {user}"
-    )
-    if 200 <= response.status_code < 300:
-        logger.info(log_file_message)
-    elif 400 <= response.status_code < 500:
-        logger.warning(log_file_message)
-    else:
-        logger.error(log_file_message)
-
-@app.before_request
-def before_request():
-    request.start_time = time.time()
-
-@app.after_request
-def after_request(response):
-    log_request(response)
-    return response
-
-# Validaciones y datos iniciales
 VALID_STATUSES = ['InProgress', 'Revision', 'Completed', 'Paused', 'Incomplete']
 
 def validate_date(date_str: str) -> bool:
     try:
-        datetime.strptime(date_str, '%Y-%m-%d')
+        datetime.datetime.strptime(date_str, '%Y-%m-%d')
         return True
-    except ValueError:
+    except ValueError:  
         return False
 
 def init_db():
@@ -186,28 +82,26 @@ def init_db():
             upsert=True
         )
 
-# Decorador de autenticación
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = request.headers.get('Authorization')
         if not token:
-            return jsonify({'statusCode': 401, 'intData': {'message': 'Token requerido', 'data': None}}), 401
+            return jsonify({'message': 'Token requerido', 'status': 'error'}), 401
         try:
             if token.startswith("Bearer "):
                 token = token.split(" ")[1]
             decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             if decoded.get('permission') != 'admin':
-                return jsonify({'statusCode': 403, 'intData': {'message': 'Permiso de admin requerido', 'data': None}}), 403
+                return jsonify({'message': 'Permiso de admin requerido', 'status': 'error'}), 403
             request.user = decoded
         except jwt.ExpiredSignatureError:
-            return jsonify({'statusCode': 401, 'intData': {'message': 'Token expirado', 'data': None}}), 401
+            return jsonify({'message': 'Token expirado', 'status': 'error'}), 401
         except jwt.InvalidTokenError:
-            return jsonify({'statusCode': 401, 'intData': {'message': 'Token inválido', 'data': None}}), 401
+            return jsonify({'message': 'Token inválido', 'status': 'error'}), 401
         return f(*args, **kwargs)
     return decorated
 
-# Rutas
 @app.route('/tasks', methods=['GET'])
 @limiter.limit("30 per minute")
 def get_tasks():
@@ -264,7 +158,7 @@ def create_task():
     result = tasks_collection.insert_one(data)
     data["id"] = str(result.inserted_id)
     if '_id' in data:
-        del data['_id']
+        del data['_id']  # Eliminar el ObjectId no serializable
     return jsonify({"statusCode": 201, "intData": {"message": "Tarea creada exitosamente", "data": data}})
 
 @app.route('/update_task/<string:task_id>', methods=['PUT'])
@@ -282,7 +176,7 @@ def edit_task(task_id):
         return jsonify({"statusCode": 400, "intData": {"message": f"El status debe ser uno de: {', '.join(VALID_STATUSES)}", "data": None}})
     
     if not validate_date(data['created_at']) or not validate_date(data['dead_line']):
-        return jsonify({"statusCode": 400, "intData": {"message": "Formato de día inválido (YYYY-MM-DD)", "data": None}})
+        return jupytext({"statusCode": 400, "intData": {"message": "Formato de día inválido (YYYY-MM-DD)", "data": None}})
     
     try:
         obj_id = ObjectId(task_id)
@@ -351,15 +245,6 @@ def update_task_status(task_id):
     except ValueError:
         return jsonify({"statusCode": 400, "intData": {"message": "ID de tarea inválido", "data": None}})
 
-@app.route('/logs', methods=['GET'])
-@limiter.limit("30 per minute")
-@token_required
-def get_logs():
-    logs = list(task_logs_collection.find().sort("timestamp", -1))
-    logs_list = [{"id": str(log["_id"]), **{k: v for k, v in log.items() if k != "_id"}} for log in logs]
-    return jsonify({"statusCode": 200, "intData": {"message": "Logs recuperados con éxito", "data": logs_list}})
-
-# Arranque de la app
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 5003))
