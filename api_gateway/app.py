@@ -30,6 +30,7 @@ AUTH_SERVICE_URL = os.environ.get('AUTH_SERVICE_URL', "https://auth-services-ja8
 USER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', "https://user-services-wwqz.onrender.com")
 TASK_SERVICE_URL = os.environ.get('TASK_SERVICE_URL', "https://task-services-vrvc.onrender.com")
 SECRET_KEY = os.environ.get('SECRET_KEY', "QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8Jo6//g")
+REDIS_URL = os.environ.get('REDIS_URL', "redis://red-d2gm9ibuibrs73eft4l0:6379")  # Default fallback, expects Redis URL from Render
 
 # =========================
 # Configuración del logger
@@ -42,13 +43,13 @@ logging.basicConfig(
 logger = logging.getLogger('api_logger')
 
 # =========================
-# Configuración Rate Limiter
+# Configuración Rate Limiter con Redis
 # =========================
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["500 per hour"],  # Límite global conservador
-    storage_uri="memory://"  # Usamos memoria por simplicidad, considera Redis para alta carga
+    storage_uri=REDIS_URL  # Usamos Redis como backend de almacenamiento
 )
 
 # =========================
@@ -93,7 +94,7 @@ def rate_limit_exceeded(e):
 
     response = jsonify({
         'error': 'Límite de peticiones excedido',
-        'message': f'Has alcanzado el límite de peticiones: {limit_message}. Por favor, intenta de nuevo más tarde.',
+        'message': f'NHas alcanzado el límite de peticiones: {limit_message}. Por favor, intenta de nuevo más tarde.',
         'statusCode': 429
     })
     response.status_code = 429
