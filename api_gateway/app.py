@@ -12,12 +12,13 @@ from pymongo import MongoClient, DESCENDING
 from bson import ObjectId
 import pytz
 import ssl
+import traceback
 
 # =========================
 # Configuración Flask
 # =========================
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Especifica orígenes permitidos
 
 # =========================
 # Variables de entorno
@@ -73,8 +74,10 @@ def init_db():
         bans_collection = db['bans']  # Nueva colección para IPs bloqueadas
         logs_collection.create_index("timestamp")
         print("[OK] Conectado a MongoDB Atlas")
+        logger.info("[OK] Conectado a MongoDB Atlas")
     except Exception as e:
         print(f"[Error] No se pudo conectar a MongoDB: {e}")
+        logger.error(f"[Error] No se pudo conectar a MongoDB: {e}")
 
 # Inicializamos DB al iniciar el servidor
 init_db()
@@ -117,7 +120,9 @@ def check_banned():
 # =========================
 def log_request(response):
     if logs_collection is None:
-        return response
+        init_db()  # Reintenta conexión si es necesario
+        if logs_collection is None:
+            return response
 
     start_time = getattr(request, 'start_time', time.time())
     duration = time.time() - start_time
@@ -150,7 +155,7 @@ def log_request(response):
     try:
         logs_collection.insert_one(log_entry)
     except Exception as e:
-        logger.error(f"Error guardando log en MongoDB: {e}")
+        logger.error(f"Error guardando log en MongoDB: {e}\n{traceback.format_exc()}")
 
     log_message = (
         f"Route: {request.path} "
@@ -183,7 +188,11 @@ def after_request(response):
 def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
     try:
-        # Filtros opcionales desde los parámetros de la solicitud
+        if logs_collection is None:
+            init_db()
+            if logs_collection is None:
+                raise Exception("No se pudo conectar a MongoDB después de reintento")
+
         user = request.args.get('user')
         route = request.args.get('route')
         status = request.args.get('status')
@@ -196,13 +205,17 @@ def get_logs():
         if route:
             query['route'] = route
         if status:
-            query['status'] = int(status)  # Ajusta según el formato de status
+            query['status'] = int(status)
         if start_date and end_date:
             query['timestamp'] = {"$gte": start_date, "$lte": end_date}
-        
-        logs = list(logs_collection.find().sort("timestamp", -1))
+
+        logger.info("Solicitud GET a /logs con query: %s", query)
+
+        logs = list(logs_collection.find(query).sort("timestamp", -1))
         for log in logs:
-            log['_id'] = str(log['_id'])  # Convierte ObjectId a string para JSON
+            log['_id'] = str(log['_id'])
+
+        logger.info("Logs recuperados: %d documentos", len(logs))
 
         return jsonify({
             "statusCode": 200,
@@ -212,6 +225,7 @@ def get_logs():
             }
         })
     except Exception as e:
+        logger.error("Error en get_logs: %s\n%s", str(e), traceback.format_exc())
         return jsonify({
             "statusCode": 500,
             "intData": {
@@ -225,46 +239,59 @@ def get_logs():
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
-    resp = requests.request(
-        method=method,
-        url=url,
-        json=request.get_json(silent=True),
-        headers={key: value for key, value in request.headers if key.lower() != 'host'},
-        timeout=5  # Agregado para evitar bloqueos
-    )
-    return jsonify(resp.json()), resp.status_code
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            json=request.get_json(silent=True),
+            headers={key: value for key, value in request.headers if key.lower() != 'host'},
+            timeout=5  # Agregado para evitar bloqueos
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        logger.error("Error en proxy_auth: %s\n%s", str(e), traceback.format_exc())
+        return jsonify({"error": "Error interno en el servicio de autenticación"}), 500
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @limiter.limit("50 per second")  # Reducido temporalmente
 def proxy_user(path):
     method = request.method
     url = f'{USER_SERVICE_URL}/{path}'
-    resp = requests.request(
-        method=method,
-        url=url,
-        json=request.get_json(silent=True),
-        headers={key: value for key, value in request.headers if key.lower() != 'host'},
-        timeout=5  # Agregado para evitar bloqueos
-    )
-    return jsonify(resp.json()), resp.status_code
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            json=request.get_json(silent=True),
+            headers={key: value for key, value in request.headers if key.lower() != 'host'},
+            timeout=5  # Agregado para evitar bloqueos
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        logger.error("Error en proxy_user: %s\n%s", str(e), traceback.format_exc())
+        return jsonify({"error": "Error interno en el servicio de usuario"}), 500
 
 @app.route('/task/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @limiter.limit("50 per second")  # Reducido temporalmente
 def proxy_task(path):
     method = request.method
     url = f'{TASK_SERVICE_URL}/{path}'
-    resp = requests.request(
-        method=method,
-        url=url,
-        json=request.get_json(silent=True),
-        headers={key: value for key, value in request.headers if key.lower() != 'host'},
-        timeout=5  # Agregado para evitar bloqueos
-    )
-    return jsonify(resp.json()), resp.status_code
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            json=request.get_json(silent=True),
+            headers={key: value for key, value in request.headers if key.lower() != 'host'},
+            timeout=5  # Agregado para evitar bloqueos
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        logger.error("Error en proxy_task: %s\n%s", str(e), traceback.format_exc())
+        return jsonify({"error": "Error interno en el servicio de tareas"}), 500
 
 # =========================
 # Arranque de la app
 # =========================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    print(f"Escuchando en el puerto {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False para producción
