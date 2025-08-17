@@ -11,7 +11,7 @@ import base64
 from flask_limiter import Limiter  # type: ignore
 from flask_limiter.util import get_remote_address  # type: ignore
 from pymongo import MongoClient  # type: ignore
-import os  # Agregado para variables de entorno
+import os
 
 app = Flask(__name__)
 CORS(app)
@@ -20,6 +20,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8
 client = MongoClient(os.environ.get('MONGO_URI', 'mongodb+srv://2023171002:1234@cluster0.rquhrnu.mongodb.net/auth_db?retryWrites=true&w=majority&appName=Cluster0'))
 db = client['auth_db']
 users_collection = db['users']
+logs_collection = db['auth_logs']  # Nueva colección para logs
 
 limiter = Limiter(
     get_remote_address,
@@ -35,23 +36,36 @@ def init_db():
         if not users_collection.find_one({"username": user["username"]}):
             users_collection.insert_one(user)
 
+def log_action(user, route, status, message):
+    """Función para registrar una acción en la colección de logs."""
+    log_entry = {
+        "user": user or "anonymous",
+        "route": route,
+        "status": status,
+        "message": message,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+    logs_collection.insert_one(log_entry)
+
 @app.route('/register', methods=['POST'])
 @limiter.limit("100 per minute")
 def register():
     data = request.get_json()
     required_fields = ['username', 'password']
     if not all(field in data for field in required_fields):
+        log_action(None, '/register', 400, "Todos los campos son requeridos")
         return jsonify({"statusCode": 400, "intData": {"message": "Todos los campos son requeridos", "data": None}})
 
     username = data['username']
     password = data['password']
 
     if users_collection.find_one({"username": username}):
+        log_action(username, '/register', 400, "Nombre de usuario ya registrado")
         return jsonify({"statusCode": 400, "intData": {"message": "Nombre de usuario ya registrado", "data": None}})
 
     secret = pyotp.random_base32()
     totp = pyotp.TOTP(secret)
-    provisioning_uri = totp.provisioning_uri(name=username, issuer_name='TuApp')
+    provisioning_uri = totp.proing_uri(name=username, issuer_name='TuApp')
 
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data(provisioning_uri)
@@ -70,10 +84,13 @@ def register():
     }
     users_collection.insert_one(user)
 
+    log_action(username, '/register', 201, "Usuario registrado exitosamente")
     return jsonify({
         "statusCode": 201,
         "intData": {
-            "message": "Usuario registrado exitosamente. Escanea el código QR con tu app de autenticación.",
+            "message": "Usuario registrado exitosamente.
+
+ Escanea el código QR con tu app de autenticación.",
             "data": {"qr_code": f"data:image/png;base64,{qr_code}", "secret": secret}
         }
     })
@@ -87,15 +104,18 @@ def login():
     otp = data.get('otp')
 
     if not username or not password or not otp:
+        log_action(username or "anonymous", '/login', 400, "Usuario, contraseña y código OTP son requeridos")
         return jsonify({"statusCode": 400, "intData": {"message": "Usuario, contraseña y código OTP son requeridos", "data": None}})
 
     user = users_collection.find_one({"username": username})
     if not user or not check_password_hash(user["password"], password):
+        log_action(username or "anonymous", '/login', 401, "Credenciales incorrectas")
         return jsonify({"statusCode": 401, "intData": {"message": "Credenciales incorrectas", "data": None}})
 
     if user.get("two_factor_enabled", False):
         totp = pyotp.TOTP(user["two_factor_secret"])
         if not totp.verify(otp, valid_window=1):
+            log_action(username, '/login', 401, "Código OTP inválido")
             return jsonify({"statusCode": 401, "intData": {"message": "Código OTP inválido", "data": None}})
 
     payload = {
@@ -106,7 +126,52 @@ def login():
     }
     token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
 
+    log_action(username, '/login', 200, "Login exitoso")
     return jsonify({"statusCode": 200, "intData": {"message": "Login exitoso", "token": token}})
+
+@app.route('/logs', methods=['GET'])
+@limiter.limit("100 per minute")  # Ajustado a un límite más razonable
+def get_logs():
+    """Recupera los logs de MongoDB con filtros opcionales."""
+    try:
+        # Filtros opcionales desde los parámetros de la solicitud
+        user = request.args.get('user')
+        route = request.args.get('route')
+        status = request.args.get('status')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+
+        query = {}
+        if user:
+            query['user'] = user
+        if route:
+            query['route'] = route
+        if status:
+            query['status'] = int(status)
+        if start_date and end_date:
+            query['timestamp'] = {"$gte": start_date, "$lte": end_date}
+
+        logs = list(logs_collection.find(query).sort("timestamp", -1))
+        for log in logs:
+            log['_id'] = str(log['_id'])  # Convierte ObjectId a string para JSON
+
+        log_action(request.args.get('user') or "anonymous", '/logs', 200, "Logs recuperados]")
+        return jsonify({
+            "statusCode": 200,
+            "intData": {
+                "message": "Logs recuperados exitosamente",
+                "data": logs
+            }
+        })
+    except Exception as e:
+        log_action(request.args.get('user') or "anonymous", '/logs', 500, f"Error al recuperar logs: {str(e)}")
+        return jsonify({
+            "statusCode": 500,
+            "intData": {
+                "message": "Error al recuperar los logs",
+                "error": str(e)
+            }
+        })
 
 if __name__ == '__main__':
     init_db()
