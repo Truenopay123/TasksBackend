@@ -9,6 +9,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter, RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient, DESCENDING
+from pymongo.errors import ConnectionError, ServerSelectionTimeoutError
 from bson import ObjectId
 import traceback
 import sys
@@ -73,7 +74,7 @@ def init_db(max_retries=3, delay=5):
                 MONGO_URI,
                 tls=True,
                 tlsAllowInvalidCertificates=False,
-                serverSelectionTimeoutMS=5000  # Timeout de 5 segundos
+                serverSelectionTimeoutMS=5000
             )
             db = client['gateway_db']
             logs_collection = db['logs']
@@ -81,14 +82,15 @@ def init_db(max_retries=3, delay=5):
             logs_collection.create_index("timestamp")
             logger.info("[OK] Conectado a MongoDB Atlas")
             print("[OK] Conectado a MongoDB Atlas")
-            return
-        except Exception as e:
+            return True
+        except (ConnectionError, ServerSelectionTimeoutError) as e:
             logger.error("[Error] Intento %d de conexión a MongoDB fallido: %s", attempt + 1, str(e))
             print(f"[Error] Intento {attempt + 1} de conexión a MongoDB fallido: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(delay)
     logger.critical("No se pudo conectar a MongoDB después de %d intentos", max_retries)
     print(f"No se pudo conectar a MongoDB después de {max_retries} intentos")
+    return False
 
 # Inicializamos DB al iniciar el servidor
 init_db()
@@ -131,8 +133,7 @@ def check_banned():
 # =========================
 def log_request(response):
     if logs_collection is None:
-        init_db()
-        if logs_collection is None:
+        if not init_db():
             return response
 
     start_time = getattr(request, 'start_time', time.time())
@@ -205,8 +206,7 @@ def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
     try:
         if logs_collection is None:
-            init_db()
-            if logs_collection is None:
+            if not init_db():
                 raise Exception("No se pudo conectar a MongoDB después de reintentos")
 
         user = request.args.get('user')
@@ -230,6 +230,8 @@ def get_logs():
 
         logger.info("Solicitud GET a /logs con query: %s", query)
 
+        # Forzar verificación de conexión antes de la consulta
+        client.admin.command('ping')
         logs = list(logs_collection.find(query).sort("timestamp", -1))
         for log in logs:
             log['_id'] = str(log['_id'])
@@ -243,9 +245,19 @@ def get_logs():
                 "data": logs
             }
         })
+    except (ConnectionError, ServerSelectionTimeoutError) as e:
+        logger.error("Error de conexión a MongoDB en get_logs: %s\n%s", str(e), traceback.format_exc())
+        print(f"Error de conexión a MongoDB en get_logs: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({
+            "statusCode": 500,
+            "intData": {
+                "message": "Error al recuperar los logs",
+                "error": "Fallo de conexión con la base de datos"
+            }
+        })
     except Exception as e:
         logger.error("Error en get_logs: %s\n%s", str(e), traceback.format_exc())
-        print(f"Error en get_logs: {str(e)}\n{traceback.format_exc()}")  # Forzar salida a stdout
+        print(f"Error en get_logs: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
             "statusCode": 500,
             "intData": {
