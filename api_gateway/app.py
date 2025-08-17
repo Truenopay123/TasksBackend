@@ -30,7 +30,7 @@ AUTH_SERVICE_URL = os.environ.get('AUTH_SERVICE_URL', "https://auth-services-ja8
 USER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', "https://user-services-wwqz.onrender.com")
 TASK_SERVICE_URL = os.environ.get('TASK_SERVICE_URL', "https://task-services-vrvc.onrender.com")
 SECRET_KEY = os.environ.get('SECRET_KEY', "QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8Jo6//g")
-REDIS_URL = os.environ.get('REDIS_URL', "redis://red-d2gm9ibuibrs73eft4l0:6379")  # Default fallback, expects Redis URL from Render
+REDIS_URL = os.environ.get('REDIS_URL', "redis://red-d2gm9ibuibrs73eft4l0:6379")  # Redis URL from Render
 
 # =========================
 # Configuración del logger
@@ -48,7 +48,7 @@ logger = logging.getLogger('api_logger')
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["500 per hour"],  # Límite global conservador
+    default_limits=["1000 per second", "500 per hour"],  # Límite global: 1000 req/s y 500 req/h
     storage_uri=REDIS_URL  # Usamos Redis como backend de almacenamiento
 )
 
@@ -86,15 +86,40 @@ def rate_limit_exceeded(e):
         '/auth/': '100 peticiones por segundo',
         '/user/': '100 peticiones por segundo',
         '/task/': '100 peticiones por segundo',
-        '/logs': '100 peticiones por segundo'
+        '/logs': '100 peticiones por segundo',
+        '/': '1000 peticiones por segundo'  # Límite global
     }
-    default_limits = '500 peticiones por hora'
-    route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/', '/logs')) else None
+    default_limits = '1000 peticiones por segundo o 500 peticiones por hora'
+    route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/', '/logs')) else '/'
     limit_message = route_limits.get(route, default_limits)
+
+    log_message = (
+        f"Rate limit excedido: {limit_message} "
+        f"Route: {request.path} "
+        f"IP: {get_remote_address()} "
+        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    logger.warning(log_message)
+
+    # Guardar en MongoDB si logs_collection está disponible
+    if logs_collection:
+        try:
+            logs_collection.insert_one({
+                'route': request.path,
+                'service': 'rate_limit',
+                'method': request.method,
+                'status': 429,
+                'response_time': 0,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'user': 'anonymous',
+                'error': 'Rate limit excedido'
+            })
+        except Exception as e:
+            logger.error(f"Error guardando log de rate limit en MongoDB: {e}")
 
     response = jsonify({
         'error': 'Límite de peticiones excedido',
-        'message': f'NHas alcanzado el límite de peticiones: {limit_message}. Por favor, intenta de nuevo más tarde.',
+        'message': f'Has alcanzado el límite de peticiones: {limit_message}. Por favor, intenta de nuevo más tarde.',
         'statusCode': 429
     })
     response.status_code = 429
