@@ -18,7 +18,7 @@ import traceback
 # Configuración Flask
 # =========================
 app = Flask(__name__)
-CORS(app)  # Especifica orígenes permitidos
+CORS(app, resources={r"/logs": {"origins": "https://tasks-seguridad.vercel.app"}})  # Especifica orígenes permitidos
 
 # =========================
 # Variables de entorno
