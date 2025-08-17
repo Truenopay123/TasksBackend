@@ -9,16 +9,15 @@ from flask_cors import CORS
 from flask_limiter import Limiter, RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient, DESCENDING
-from pymongo.errors import ConnectionError, ServerSelectionTimeoutError
 from bson import ObjectId
-import traceback
-import sys
+import pytz
+import ssl
 
 # =========================
 # Configuración Flask
 # =========================
 app = Flask(__name__)
-CORS(app, resources={r"/logs": {"origins": "https://tasks-seguridad.vercel.app", "methods": ["GET", "OPTIONS"]}})
+CORS(app)
 
 # =========================
 # Variables de entorno
@@ -31,7 +30,6 @@ AUTH_SERVICE_URL = os.environ.get('AUTH_SERVICE_URL', "https://auth-services-ja8
 USER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', "https://user-services-wwqz.onrender.com")
 TASK_SERVICE_URL = os.environ.get('TASK_SERVICE_URL', "https://task-services-vrvc.onrender.com")
 SECRET_KEY = os.environ.get('SECRET_KEY', "QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8Jo6//g")
-REDIS_URI = os.environ.get('REDIS_URI')
 
 # =========================
 # Configuración del logger
@@ -43,19 +41,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger('api_logger')
 
-# Forzar logs a stdout para Render
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
-
 # =========================
 # Configuración Rate Limiter
 # =========================
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["500 per hour"],
-    storage_uri=REDIS_URI if REDIS_URI else "memory://"
+    default_limits=["500 per hour"],  # Límite global conservador
+    storage_uri="memory://"  # Usamos memoria por simplicidad, considera Redis para alta carga
 )
 
 # =========================
@@ -64,33 +57,21 @@ limiter = Limiter(
 client = None
 db = None
 logs_collection = None
-bans_collection = None
 
-def init_db(max_retries=3, delay=5):
-    global client, db, logs_collection, bans_collection
-    for attempt in range(max_retries):
-        try:
-            client = MongoClient(
-                MONGO_URI,
-                tls=True,
-                tlsAllowInvalidCertificates=False,
-                serverSelectionTimeoutMS=5000
-            )
-            db = client['gateway_db']
-            logs_collection = db['logs']
-            bans_collection = db['bans']
-            logs_collection.create_index("timestamp")
-            logger.info("[OK] Conectado a MongoDB Atlas")
-            print("[OK] Conectado a MongoDB Atlas")
-            return True
-        except (ConnectionError, ServerSelectionTimeoutError) as e:
-            logger.error("[Error] Intento %d de conexión a MongoDB fallido: %s", attempt + 1, str(e))
-            print(f"[Error] Intento {attempt + 1} de conexión a MongoDB fallido: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-    logger.critical("No se pudo conectar a MongoDB después de %d intentos", max_retries)
-    print(f"No se pudo conectar a MongoDB después de {max_retries} intentos")
-    return False
+def init_db():
+    global client, db, logs_collection
+    try:
+        client = MongoClient(
+            MONGO_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=False
+        )
+        db = client['gateway_db']
+        logs_collection = db['logs']
+        logs_collection.create_index("timestamp")
+        print("[OK] Conectado a MongoDB Atlas")
+    except Exception as e:
+        print(f"[Error] No se pudo conectar a MongoDB: {e}")
 
 # Inicializamos DB al iniciar el servidor
 init_db()
@@ -101,10 +82,10 @@ init_db()
 @app.errorhandler(RateLimitExceeded)
 def rate_limit_exceeded(e):
     route_limits = {
-        '/auth/': '50 peticiones por segundo',
-        '/user/': '50 peticiones por segundo',
-        '/task/': '50 peticiones por segundo',
-        '/logs': '50 peticiones por segundo'
+        '/auth/': '100 peticiones por segundo',
+        '/user/': '100 peticiones por segundo',
+        '/task/': '100 peticiones por segundo',
+        '/logs': '100 peticiones por segundo'
     }
     default_limits = '500 peticiones por hora'
     route = request.path.split('/')[1] + '/' if request.path.startswith(('/auth/', '/user/', '/task/', '/logs')) else None
@@ -119,22 +100,11 @@ def rate_limit_exceeded(e):
     return response
 
 # =========================
-# Verificación de bans antes de cada request
-# =========================
-@app.before_request
-def check_banned():
-    ip = get_remote_address()
-    if bans_collection and bans_collection.find_one({'ip': ip}):
-        return jsonify({'error': 'IP bloqueada por abuso'}), 403
-    request.start_time = time.time()
-
-# =========================
 # Logging de requests
 # =========================
 def log_request(response):
     if logs_collection is None:
-        if not init_db():
-            return response
+        return response
 
     start_time = getattr(request, 'start_time', time.time())
     duration = time.time() - start_time
@@ -161,13 +131,12 @@ def log_request(response):
         'status': response.status_code,
         'response_time': round(duration, 2),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'user': user,
-        'ip': get_remote_address()
+        'user': user
     }
     try:
         logs_collection.insert_one(log_entry)
     except Exception as e:
-        logger.error(f"Error guardando log en MongoDB: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error guardando log en MongoDB: {e}")
 
     log_message = (
         f"Route: {request.path} "
@@ -176,8 +145,7 @@ def log_request(response):
         f"Status: {response.status_code} "
         f"response_time: {duration:.2f}s "
         f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-        f"User: {user} "
-        f"IP: {log_entry['ip']}"
+        f"User: {user}"
     )
     if 200 <= response.status_code < 300:
         logger.info(log_message)
@@ -187,6 +155,10 @@ def log_request(response):
         logger.error(log_message)
 
 # Middleware para logear solicitudes y respuestas
+@app.before_request
+def before_request():
+    request.start_time = time.time()
+
 @app.after_request
 def after_request(response):
     log_request(response)
@@ -195,20 +167,12 @@ def after_request(response):
 # =========================
 # Rutas
 # =========================
-@app.route('/', methods=['HEAD'])
-def health_check():
-    """Manejador básico para solicitudes HEAD de Render."""
-    return '', 200
-
-@app.route('/logs', methods=['GET', 'OPTIONS'])
-@limiter.limit("50 per second")
+@app.route('/logs', methods=['GET'])
+@limiter.limit("100 per second")
 def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
     try:
-        if logs_collection is None:
-            if not init_db():
-                raise Exception("No se pudo conectar a MongoDB después de reintentos")
-
+        # Filtros opcionales desde los parámetros de la solicitud
         user = request.args.get('user')
         route = request.args.get('route')
         status = request.args.get('status')
@@ -221,22 +185,13 @@ def get_logs():
         if route:
             query['route'] = route
         if status:
-            try:
-                query['status'] = int(status)
-            except (ValueError, TypeError):
-                raise ValueError("El parámetro 'status' debe ser un número entero")
+            query['status'] = int(status)  # Ajusta según el formato de status
         if start_date and end_date:
             query['timestamp'] = {"$gte": start_date, "$lte": end_date}
-
-        logger.info("Solicitud GET a /logs con query: %s", query)
-
-        # Forzar verificación de conexión antes de la consulta
-        client.admin.command('ping')
-        logs = list(logs_collection.find(query).sort("timestamp", -1))
+        
+        logs = list(logs_collection.find().sort("timestamp", -1))
         for log in logs:
-            log['_id'] = str(log['_id'])
-
-        logger.info("Logs recuperados: %d documentos", len(logs))
+            log['_id'] = str(log['_id'])  # Convierte ObjectId a string para JSON
 
         return jsonify({
             "statusCode": 200,
@@ -245,19 +200,7 @@ def get_logs():
                 "data": logs
             }
         })
-    except (ConnectionError, ServerSelectionTimeoutError) as e:
-        logger.error("Error de conexión a MongoDB en get_logs: %s\n%s", str(e), traceback.format_exc())
-        print(f"Error de conexión a MongoDB en get_logs: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({
-            "statusCode": 500,
-            "intData": {
-                "message": "Error al recuperar los logs",
-                "error": "Fallo de conexión con la base de datos"
-            }
-        })
     except Exception as e:
-        logger.error("Error en get_logs: %s\n%s", str(e), traceback.format_exc())
-        print(f"Error en get_logs: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
             "statusCode": 500,
             "intData": {
@@ -267,63 +210,47 @@ def get_logs():
         })
 
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")
+@limiter.limit("100 per second")
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
-    try:
-        resp = requests.request(
-            method=method,
-            url=url,
-            json=request.get_json(silent=True),
-            headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5
-        )
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        logger.error("Error en proxy_auth: %s\n%s", str(e), traceback.format_exc())
-        return jsonify({"error": "Error interno en el servicio de autenticación"}), 500
+    resp = requests.request(
+        method=method,
+        url=url,
+        json=request.get_json(silent=True),
+        headers={key: value for key, value in request.headers if key.lower() != 'host'}
+    )
+    return jsonify(resp.json()), resp.status_code
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")
+@limiter.limit("100 per second")
 def proxy_user(path):
     method = request.method
     url = f'{USER_SERVICE_URL}/{path}'
-    try:
-        resp = requests.request(
-            method=method,
-            url=url,
-            json=request.get_json(silent=True),
-            headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5
-        )
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        logger.error("Error en proxy_user: %s\n%s", str(e), traceback.format_exc())
-        return jsonify({"error": "Error interno en el servicio de usuario"}), 500
+    resp = requests.request(
+        method=method,
+        url=url,
+        json=request.get_json(silent=True),
+        headers={key: value for key, value in request.headers if key.lower() != 'host'}
+    )
+    return jsonify(resp.json()), resp.status_code
 
 @app.route('/task/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")
+@limiter.limit("100 per second")
 def proxy_task(path):
     method = request.method
     url = f'{TASK_SERVICE_URL}/{path}'
-    try:
-        resp = requests.request(
-            method=method,
-            url=url,
-            json=request.get_json(silent=True),
-            headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5
-        )
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        logger.error("Error en proxy_task: %s\n%s", str(e), traceback.format_exc())
-        return jsonify({"error": "Error interno en el servicio de tareas"}), 500
+    resp = requests.request(
+        method=method,
+        url=url,
+        json=request.get_json(silent=True),
+        headers={key: value for key, value in request.headers if key.lower() != 'host'}
+    )
+    return jsonify(resp.json()), resp.status_code
 
 # =========================
 # Arranque de la app
 # =========================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"Escuchando en el puerto {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=True)
