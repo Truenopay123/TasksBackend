@@ -10,15 +10,14 @@ from flask_limiter import Limiter, RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from pymongo import MongoClient, DESCENDING
 from bson import ObjectId
-import pytz
-import ssl
 import traceback
+import sys
 
 # =========================
 # Configuración Flask
 # =========================
 app = Flask(__name__)
-CORS(app, resources={r"/logs": {"origins": "https://tasks-seguridad.vercel.app"}})  # Especifica orígenes permitidos
+CORS(app, resources={r"/logs": {"origins": "https://tasks-seguridad.vercel.app", "methods": ["GET", "OPTIONS"]}})
 
 # =========================
 # Variables de entorno
@@ -31,7 +30,7 @@ AUTH_SERVICE_URL = os.environ.get('AUTH_SERVICE_URL', "https://auth-services-ja8
 USER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', "https://user-services-wwqz.onrender.com")
 TASK_SERVICE_URL = os.environ.get('TASK_SERVICE_URL', "https://task-services-vrvc.onrender.com")
 SECRET_KEY = os.environ.get('SECRET_KEY', "QHZ/5n4Y+AugECPP12uVY/9mWZ14nqEfdiBB8Jo6//g")
-REDIS_URI = os.environ.get('REDIS_URI')  # Requerido para producción; configura en Render
+REDIS_URI = os.environ.get('REDIS_URI')
 
 # =========================
 # Configuración del logger
@@ -43,14 +42,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger('api_logger')
 
+# Forzar logs a stdout para Render
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
+
 # =========================
 # Configuración Rate Limiter
 # =========================
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["500 per hour"],  # Límite global conservador
-    storage_uri=REDIS_URI if REDIS_URI else "memory://"  # Usa Redis si está configurado, sino memoria
+    default_limits=["500 per hour"],
+    storage_uri=REDIS_URI if REDIS_URI else "memory://"
 )
 
 # =========================
@@ -59,25 +63,32 @@ limiter = Limiter(
 client = None
 db = None
 logs_collection = None
-bans_collection = None  # Nueva colección para bans
+bans_collection = None
 
-def init_db():
+def init_db(max_retries=3, delay=5):
     global client, db, logs_collection, bans_collection
-    try:
-        client = MongoClient(
-            MONGO_URI,
-            tls=True,
-            tlsAllowInvalidCertificates=False
-        )
-        db = client['gateway_db']
-        logs_collection = db['logs']
-        bans_collection = db['bans']  # Nueva colección para IPs bloqueadas
-        logs_collection.create_index("timestamp")
-        print("[OK] Conectado a MongoDB Atlas")
-        logger.info("[OK] Conectado a MongoDB Atlas")
-    except Exception as e:
-        print(f"[Error] No se pudo conectar a MongoDB: {e}")
-        logger.error(f"[Error] No se pudo conectar a MongoDB: {e}")
+    for attempt in range(max_retries):
+        try:
+            client = MongoClient(
+                MONGO_URI,
+                tls=True,
+                tlsAllowInvalidCertificates=False,
+                serverSelectionTimeoutMS=5000  # Timeout de 5 segundos
+            )
+            db = client['gateway_db']
+            logs_collection = db['logs']
+            bans_collection = db['bans']
+            logs_collection.create_index("timestamp")
+            logger.info("[OK] Conectado a MongoDB Atlas")
+            print("[OK] Conectado a MongoDB Atlas")
+            return
+        except Exception as e:
+            logger.error("[Error] Intento %d de conexión a MongoDB fallido: %s", attempt + 1, str(e))
+            print(f"[Error] Intento {attempt + 1} de conexión a MongoDB fallido: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+    logger.critical("No se pudo conectar a MongoDB después de %d intentos", max_retries)
+    print(f"No se pudo conectar a MongoDB después de {max_retries} intentos")
 
 # Inicializamos DB al iniciar el servidor
 init_db()
@@ -88,7 +99,7 @@ init_db()
 @app.errorhandler(RateLimitExceeded)
 def rate_limit_exceeded(e):
     route_limits = {
-        '/auth/': '50 peticiones por segundo',  # Reducido temporalmente para pruebas
+        '/auth/': '50 peticiones por segundo',
         '/user/': '50 peticiones por segundo',
         '/task/': '50 peticiones por segundo',
         '/logs': '50 peticiones por segundo'
@@ -120,7 +131,7 @@ def check_banned():
 # =========================
 def log_request(response):
     if logs_collection is None:
-        init_db()  # Reintenta conexión si es necesario
+        init_db()
         if logs_collection is None:
             return response
 
@@ -150,7 +161,7 @@ def log_request(response):
         'response_time': round(duration, 2),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'user': user,
-        'ip': get_remote_address()  # Agregado para rastreo de IPs
+        'ip': get_remote_address()
     }
     try:
         logs_collection.insert_one(log_entry)
@@ -183,15 +194,20 @@ def after_request(response):
 # =========================
 # Rutas
 # =========================
-@app.route('/logs', methods=['GET'])
-@limiter.limit("50 per second")  # Reducido temporalmente
+@app.route('/', methods=['HEAD'])
+def health_check():
+    """Manejador básico para solicitudes HEAD de Render."""
+    return '', 200
+
+@app.route('/logs', methods=['GET', 'OPTIONS'])
+@limiter.limit("50 per second")
 def get_logs():
     """Recupera los logs de MongoDB con filtros opcionales."""
     try:
         if logs_collection is None:
             init_db()
             if logs_collection is None:
-                raise Exception("No se pudo conectar a MongoDB después de reintento")
+                raise Exception("No se pudo conectar a MongoDB después de reintentos")
 
         user = request.args.get('user')
         route = request.args.get('route')
@@ -205,7 +221,10 @@ def get_logs():
         if route:
             query['route'] = route
         if status:
-            query['status'] = int(status)
+            try:
+                query['status'] = int(status)
+            except (ValueError, TypeError):
+                raise ValueError("El parámetro 'status' debe ser un número entero")
         if start_date and end_date:
             query['timestamp'] = {"$gte": start_date, "$lte": end_date}
 
@@ -226,6 +245,7 @@ def get_logs():
         })
     except Exception as e:
         logger.error("Error en get_logs: %s\n%s", str(e), traceback.format_exc())
+        print(f"Error en get_logs: {str(e)}\n{traceback.format_exc()}")  # Forzar salida a stdout
         return jsonify({
             "statusCode": 500,
             "intData": {
@@ -235,7 +255,7 @@ def get_logs():
         })
 
 @app.route('/auth/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")  # Reducido temporalmente
+@limiter.limit("50 per second")
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
@@ -245,7 +265,7 @@ def proxy_auth(path):
             url=url,
             json=request.get_json(silent=True),
             headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5  # Agregado para evitar bloqueos
+            timeout=5
         )
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
@@ -253,7 +273,7 @@ def proxy_auth(path):
         return jsonify({"error": "Error interno en el servicio de autenticación"}), 500
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")  # Reducido temporalmente
+@limiter.limit("50 per second")
 def proxy_user(path):
     method = request.method
     url = f'{USER_SERVICE_URL}/{path}'
@@ -263,7 +283,7 @@ def proxy_user(path):
             url=url,
             json=request.get_json(silent=True),
             headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5  # Agregado para evitar bloqueos
+            timeout=5
         )
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
@@ -271,7 +291,7 @@ def proxy_user(path):
         return jsonify({"error": "Error interno en el servicio de usuario"}), 500
 
 @app.route('/task/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
-@limiter.limit("50 per second")  # Reducido temporalmente
+@limiter.limit("50 per second")
 def proxy_task(path):
     method = request.method
     url = f'{TASK_SERVICE_URL}/{path}'
@@ -281,7 +301,7 @@ def proxy_task(path):
             url=url,
             json=request.get_json(silent=True),
             headers={key: value for key, value in request.headers if key.lower() != 'host'},
-            timeout=5  # Agregado para evitar bloqueos
+            timeout=5
         )
         return jsonify(resp.json()), resp.status_code
     except Exception as e:
@@ -294,4 +314,4 @@ def proxy_task(path):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"Escuchando en el puerto {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)  # Debug=False para producción
+    app.run(host='0.0.0.0', port=port, debug=False)
