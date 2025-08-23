@@ -240,7 +240,7 @@ def get_logs():
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
-    logger.info(f"Proxying request: {method} {url}")  # Log detallado
+    logger.info(f"Proxying request: {method} {url} with body {request.get_json(silent=True)}")
     try:
         resp = requests.request(
             method=method,
@@ -249,10 +249,13 @@ def proxy_auth(path):
             headers={key: value for key, value in request.headers if key.lower() != 'host'},
             timeout=10
         )
-        logger.info(f"Received response from {url} with status {resp.status_code}")
+        logger.info(f"Received raw response from {url}: {resp.text}")
         return jsonify(resp.json()), resp.status_code
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error proxying to {url}: {str(e)}")
+        logger.error(f"Request error proxying to {url}: {str(e)}")
+        return jsonify({"error": "Error interno al proxyar", "details": str(e)}), 500
+    except ValueError as e:
+        logger.error(f"Invalid JSON response from {url}: {str(e)} - Raw response: {resp.text}")
         return jsonify({"error": "Error interno al proxyar", "details": str(e)}), 500
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
