@@ -240,13 +240,20 @@ def get_logs():
 def proxy_auth(path):
     method = request.method
     url = f'{AUTH_SERVICE_URL}/{path}'
-    resp = requests.request(
-        method=method,
-        url=url,
-        json=request.get_json(silent=True),
-        headers={key: value for key, value in request.headers if key.lower() != 'host'}
-    )
-    return jsonify(resp.json()), resp.status_code
+    logger.info(f"Proxying request: {method} {url}")  # Log detallado
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            json=request.get_json(silent=True),
+            headers={key: value for key, value in request.headers if key.lower() != 'host'},
+            timeout=10
+        )
+        logger.info(f"Received response from {url} with status {resp.status_code}")
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error proxying to {url}: {str(e)}")
+        return jsonify({"error": "Error interno al proxyar", "details": str(e)}), 500
 
 @app.route('/user/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @limiter.limit("100 per second")
